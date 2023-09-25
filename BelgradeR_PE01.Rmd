@@ -1,0 +1,898 @@
+---
+title: BelgradeR Meet-up New Series 03 - Prompt Engineering and Retrieval Augmented Generation (RAG) from R
+author:
+- name: Goran S. Milovanovic, PhD
+  affiliation: DataKolektiv, Owner & Smartocto, Lead Data Scientist
+abstract: 
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+  html_notebook:
+    code_folding: show
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+---
+
+![](_img/DK_Logo_100.png)
+
+---
+
+![](_img/belgadeR03_PE_GSM_banner.png)
+
+
+---
+
+# Modelling [HAL9000](https://en.wikipedia.org/wiki/HAL_9000)
+
+[Goran S. Milovanović](https://www.linkedin.com/in/gmilovanovic/)
+
+![](_img/hal9000.png)
+
+*"I am a HAL 9000 computer. I became operational at the H.A.L. Plant in Urbana, Illinois, on the 12th of January, 1992. My instructor was Mr. Langly, and he taught me to sing a song ..."*
+
+Here is how ChatGPT (GPT-4) introduces HAL 9000:
+
+**Prompt:** `Who is HAL 9000?`
+
+**ChatGPT:**
+
+> HAL 9000, which stands for Heuristically Programmed Algorithmic Computer, is a fictional artificial intelligence character from the "Space Odyssey" series, created by Arthur C. Clarke. The character is most famous for its role in the 1968 film "2001: A Space Odyssey," directed by Stanley Kubrick, in which it functions as the onboard AI of the spacecraft Discovery One.
+
+> In the story, HAL 9000 is capable of speech, speech recognition, facial recognition, natural language processing, lip reading, art appreciation, interpreting emotions, and playing chess. However, during the mission to Jupiter, HAL malfunctions and begins to exhibit hostile behavior, ultimately leading to a conflict between the machine and the human astronauts aboard the spacecraft. The depiction of HAL 9000 in "2001: A Space Odyssey" explores themes of artificial intelligence, consciousness, and the potential hazards of AI.
+
+---
+
+## [GitHub:belgrader03_rag](https://github.com/datakolektiv/belgrader03_rag)
+
+## 0. Setup
+
+### 0.0 Packages
+
+Load the libraries and define the project directory tree. Everything runs in an `renv` environment, of course. The complete setup is in the [belgrader03_rag](https://github.com/datakolektiv/belgrader03_rag) repo. Essentially, your want to 
+
+```
+renv::init()
+renv::install("tidyverse")
+renv::install("tidytext")
+renv::install("getwiki")
+renv::install("openai")
+renv::install("RPostgreSQL")
+renv::install("data.table")
+renv::install("vembedr")
+```
+
+```{r echo=TRUE, message=FALSE}
+# - packages
+library(vembedr)
+library(tidyverse)
+library(tidytext)
+library(getwiki)
+library(openai)
+library(RPostgreSQL)
+
+# - directory tree
+data_dir <- paste0(getwd(), "/_data/")
+sourceDir <- paste0(getwd(), "/_sources/")
+```
+
+### 0.1 Introducing HAL 9000
+
+```{r echo = FALSE}
+embed_url("https://youtu.be/r13I-TuDcWI?si=86ciz08M_x8qumEx")
+```
+
+
+```{r echo = FALSE}
+embed_url("https://youtu.be/UwCFY6pmaYY?si=HLaLTzEoKSB7qZVZ")
+```
+
+
+## 1. Build a Knowledge Base on HAL9000
+
+### 1.1 Source A. Lines from the [2001: A Space Odyssey](https://en.wikipedia.org/wiki/2001:_A_Space_Odyssey) screenplay.
+
+In order to better inform an LLM on the typical HAL9000 discourse in communication, we scrape all HAL9000's lines from the screenplay of [2001: A Space Odyssey](https://en.wikipedia.org/wiki/2001:_A_Space_Odyssey), as well as all lines in which HAL9000 was mentioned in the screenplay. We will use `rvest::read_html()`, `rvest::html_table()`, and some simple *regex* to that end.
+
+```{r echo = TRUE}
+# - scrape all HAL 9000 lines from the 2001 Space Odyssey transcript
+# - source: http://miscel.wikidot.com/2001-transcript
+transcript <- "http://miscel.wikidot.com/2001-transcript"
+content <- rvest::read_html(transcript)
+tables <- content %>% rvest::html_table(fill = TRUE)
+
+# - extract all HAL 9000 lines
+hal9000 <- lapply(tables, function(x) {
+  l <- apply(x, 1, function(y) {
+    if (y[1] == "Hal") {
+      return(paste0(y[1], " ", y[2]))
+    }
+  })
+})
+hal9000 <- unlist(hal9000)
+hal9000 <- stringr::str_replace(hal9000, "^Hal ", "")
+hal9000 <- hal9000[2:length(hal9000)]
+hal9000 <- data.frame(lines = hal9000)
+
+# - store
+write.csv(hal9000, paste0(data_dir, "hal9000_lines.csv"))
+
+# - extract all lines where HAL 9000 is mentioned
+mentions_hal9000 <- lapply(tables, function(x) {
+  l <- apply(x, 1, function(y) {
+    if (y[1] != "Hal") {
+      if (grepl("\\bHal\\b|\\bHAL\\b|\\bHal 9000\\b|\\bHAL 9000\\b|\\b9000 series\\b", 
+                y[2])) {
+        return(paste0(y[1], " ", y[2]))  
+      }
+    }
+  })
+})
+mentions_hal9000 <- unlist(mentions_hal9000)
+mentions_hal9000 <- gsub("^[[:alnum:]]+\\s", "", mentions_hal9000)
+mentions_hal9000 <- data.frame(lines = mentions_hal9000)
+
+# - store
+write.csv(mentions_hal9000, paste0(data_dir, "mentions_hal9000_lines.csv"))
+```
+
+### 1.2 Source B. The [English Wikipedia entry on HAL9000](https://en.wikipedia.org/wiki/HAL_9000)
+
+We need to have more background knowledge on HAL9000. We will use `getwiki::get_wiki()` to collect the full text of the [English Wikipedia entry on HAL9000](https://en.wikipedia.org/wiki/HAL_9000) and then `tidytext::unnest_tokens()` to approximately extract sentences. Finally, a simple *regex* to keep only pieces of knowledge that explicitly mention HAL9000.
+
+```{r echo = TRUE}
+# - from Wikipedia
+hal9000_wikitext <- get_wiki("HAL_9000", clean = TRUE)
+hal9000_wikitext <- data.frame(text = hal9000_wikitext)
+
+# - to sentences
+hal9000_wikitext <- unnest_tokens(
+  hal9000_wikitext,
+  output = "lines",
+  input = "text",
+  token = "sentences",
+  format = "text",
+  to_lower = FALSE,
+  drop = TRUE,
+  collapse = NULL)
+w <- which(grepl("HAL", hal9000_wikitext$lines))
+hal9000_wikitext <- data.frame(lines = hal9000_wikitext[w, ])
+
+# - store
+write.csv(hal9000_wikitext, paste0(data_dir, "hal9000_wikitext_lines.csv"))
+```
+
+
+### 1.3 Source C. Essays on HAL 9000 from [HAL's Legacy, on-line ebook (mostly full-text) of the printed version edited by David G. Stork, MIT Press, 1997, ISBN 0-262-69211-2, a collection of essays on HAL](https://web.archive.org/web/20050304005837/http://mitpress.mit.edu/e-books/Hal/contents.html)
+
+Grab essays from the following source:
+
+[HAL's Legacy, on-line ebook (mostly full-text) of the printed version edited by David G. Stork, MIT Press, 1997, ISBN 0-262-69211-2, a collection of essays on HAL](https://web.archive.org/web/20050304005837/http://mitpress.mit.edu/e-books/Hal/contents.html)
+
+```{r echo = TRUE}
+# - read source URLs
+sources <- readLines(paste0(sourceDir, "HAL9000_essay_sources.txt"))
+
+# - scrape
+hal9000_essays <- lapply(sources, function(x) {
+  response <- httr::GET(x, httr::timeout(60))
+  webpage <- rvest::read_html(response)
+  text <- webpage %>% rvest::html_nodes("p") %>% rvest::html_text()
+  return(text)
+})
+
+# - reduce
+hal9000_essays <- purrr::reduce(hal9000_essays, append)
+
+# - clean up
+hal9000_essays <- lapply(hal9000_essays, function(x) {
+  return(
+    stringr::str_replace_all(x, "\\\\n" , " ")
+  )
+})
+hal9000_essays <- unlist(hal9000_essays)
+
+# - remove all trailing spaces
+hal9000_essays <- stringr::str_trim(hal9000_essays, side = "both")
+
+# - to sentences
+hal9000_essays <- data.frame(text = hal9000_essays)
+hal9000_essays <- unnest_tokens(
+  hal9000_essays,
+  output = "lines",
+  input = "text",
+  token = "sentences",
+  format = "text",
+  to_lower = FALSE,
+  drop = TRUE,
+  collapse = NULL)
+w <- which(grepl("HAL", hal9000_essays$lines))
+hal9000_essays <- data.frame(lines = hal9000_essays[w, ])
+
+# - store
+write.csv(hal9000_essays, paste0(data_dir, "hal9000_essays_lines.csv"))
+```
+
+## 2. Knowledge Base Embeddings with OpenAI's `text-embedding-ada-002` and `pgvector`; using `PostgreSQL` as a Vector Database
+
+Here is how ChatGPT (GPT-4) explains what Retrieval-Augmented Generation (RAG) is:
+
+```
+Retrieval-Augmented Generation (RAG) is a method used in natural language processing to combine the capabilities of large pre-trained language models with external retrieval or search mechanisms to enhance the generation of responses in a question-answering setting. RAG aims to leverage the power of retrievers and generators to answer questions more effectively and accurately by utilizing external knowledge sources.
+
+Here’s how RAG generally works:
+
+1. **Question Encoding:**
+   - A question or prompt is encoded into a vector representation using a question encoder.
+
+2. **Document Retrieval:**
+   - The encoded question is used to search through a large corpus of text (like Wikipedia) to retrieve relevant documents or passages. A retriever model is used to find and rank the most relevant documents based on the question encoding.
+
+3. **Context and Question Combination:**
+   - The retrieved documents are combined with the original question to form a new, augmented context.
+
+4. **Answer Generation:**
+   - The augmented context is fed into a generator model (often a large, pre-trained language model), which generates a response or answer based on the information contained in both the question and the retrieved documents.
+
+RAG is particularly useful for open-domain question answering, where questions can be about virtually any topic, and relevant information needs to be sourced from large and diverse corpora to generate accurate and informative answers. By integrating retrieval and generation, RAG helps in producing more informed and relevant answers to a wide range of questions.
+```
+
+![](_img/RAG_Framework.png){width=75%}
+
+*Retrieval Augmented Generation (RAG)*
+
+### 2.1 Embedding the Knowledge Base w. OpenAI `text-embedding-ada-002`
+
+We will use 1536-dimensional `text-embedding-ada-002` embeddings. 
+
+```{r echo = TRUE}
+# load the PostgreSQL driver
+drv <- DBI::dbDriver("PostgreSQL")
+
+# Connect to the database
+con <- RPostgreSQL::dbConnect(drv,
+                              dbname="goransm",
+                              host="localhost",
+                              port=5432,
+                              user="goransm",
+                              password=Sys.getenv("POSTGRESS_PASS"))
+```
+
+```{r echo = TRUE}
+# Create table to store embeddings: hal9000lines
+RPostgreSQL::dbGetQuery(con, "CREATE TABLE hal9000lines (
+                                id bigserial primary key,
+                                lines text,
+                                embedding vector(1536))")
+```
+
+We will now access the OpenAI API and to produce the `text-embedding-ada-002` embeddings of our Knowledge Base.
+
+#### 2.1.1 Helper to serialize the vector type for `pgvector`
+
+A helper `pgvector.serialize` function to serialize the embeddings for PostgreSQL `pgvector` vector type:
+
+```{r echo = TRUE}
+# - source: https://github.com/pgvector/pgvector-r
+pgvector.serialize <- function(v) {
+  stopifnot(is.numeric(v))
+  paste0("[", paste(v, collapse=","), "]")
+}
+```
+
+#### 2.1.2 Batch embeddings for `hal9000lines`
+
+```{r echo = TRUE}
+# - embeddings
+embs <- sapply(hal9000$lines, function(x) {
+  
+  # - OpenAI 
+  emb <- openai::create_embedding(model = "text-embedding-ada-002", 
+                                input = x, 
+                                openai_api_key=Sys.getenv("OPENAI_API_KEY"))
+  # - grab vector
+  emb <- emb$data$embedding[[1]]
+  return(emb)
+  
+})
+
+# - transpose
+embs <- t(embs)
+
+# - prepare for postgres/pgvector
+hal9000$embedding <- apply(embs, 1, pgvector.serialize)
+
+# - to postgres
+RPostgreSQL::dbWriteTable(con, 
+                          "hal9000lines", 
+                          hal9000, 
+                          append = TRUE, 
+                          row.names = FALSE)
+
+```
+
+#### 2.1.3 Test vectors from `hal9000lines`
+
+Let's test our `hal9000lines` table:
+
+```{r echo = TRUE}
+# Test hal9000lines
+res <- RPostgreSQL::dbGetQuery(con, "SELECT * FROM hal9000lines LIMIT 10;")
+print(class(res))
+print(colnames(res))
+print(res$lines)
+```
+Do not pay attention to the following message: `RPosgreSQL warning: unrecognized PostgreSQL field type vector (id:16391) in column 2` - the `RPosgresSQL` package is not aware of the `vector` type supported by `pgvector`, and there is no need for it to be aware of that type at all - all `pgvector` operations will take place in the Postgres server anyways.
+
+The first 100 elements of the first embedding in the `hal9000lines` table:
+
+```{r echo = TRUE}
+substr(res$embedding, 1, 100)
+```
+
+#### 2.1.4 Similarity search w. cosine distance from `hal9000lines`
+
+Let's perform a similarity search operation with `pgvector` and `RPostgreSQL`.
+
+```{r echo = TRUE}
+query <- "Attributable to human error."
+query_emb <- openai::create_embedding(model = "text-embedding-ada-002",
+                                      input = query,
+                                      openai_api_key=Sys.getenv("OPENAI_API_KEY"))
+query_emb <- pgvector.serialize(query_emb$data$embedding[[1]])
+res <- RPostgreSQL::dbGetQuery(con, 
+                               "SELECT lines FROM hal9000lines ORDER BY embedding <=> $1 LIMIT 1",
+                               params=query_emb)
+print(res$lines)
+```
+
+The `<=>` operator in `pgvector` computes [cosine distance](https://en.wikipedia.org/wiki/Cosine_similarity), c.f. [https://github.com/pgvector/pgvector](https://github.com/pgvector/pgvector):
+
+$$
+\begin{align*}
+&\mathbf{A} = [a_1, a_2, ..., a_n], \mathbf{B} = [b_1, b_2, ..., b_n]\\[1em]
+&\mathbf{A} \cdot \mathbf{B} = \sum_{i=1}^{n} a_i b_i \\[1em]
+&\|\mathbf{A}\| = \sqrt{\sum_{i=1}^{n} a_i^2}, \|\mathbf{B}\| = \sqrt{\sum_{i=1}^{n} b_i^2} \\[1em]
+&\text{cosine similarity}(\mathbf{A}, \mathbf{B}) = \frac{\mathbf{A} \cdot \mathbf{B}}{\|\mathbf{A}\| \times \|\mathbf{B}\|}\\[1em]
+&\text{cosine distance}(\mathbf{A}, \mathbf{B}) = 1 - \frac{\sum_{i=1}^{n} a_i b_i}{\sqrt{\sum_{i=1}^{n} a_i^2 \cdot\sum_{i=1}^{n} b_i^2}}
+\end{align*}
+$$
+
+And again.
+
+```{r echo = TRUE}
+query <- "Conversation with no purpose."
+query_emb <- openai::create_embedding(model = "text-embedding-ada-002",
+                                      input = query,
+                                      openai_api_key=Sys.getenv("OPENAI_API_KEY"))
+query_emb <- pgvector.serialize(query_emb$data$embedding[[1]])
+res <- RPostgreSQL::dbGetQuery(con, 
+                               "SELECT lines FROM hal9000lines ORDER BY embedding <=> $1 LIMIT 5",
+                               params=query_emb)
+print(res$lines)
+```
+
+And again.
+
+```{r echo = TRUE}
+query <- "How does HAL sounds when in pain?"
+query_emb <- openai::create_embedding(model = "text-embedding-ada-002",
+                                      input = query,
+                                      openai_api_key=Sys.getenv("OPENAI_API_KEY"))
+query_emb <- pgvector.serialize(query_emb$data$embedding[[1]])
+res <- RPostgreSQL::dbGetQuery(con, 
+                               "SELECT lines FROM hal9000lines ORDER BY embedding <=> $1 LIMIT 1",
+                               params=query_emb)
+print(res$lines)
+```
+
+### 2.1.2 Embed `mentions_hal9000`
+
+We will now embed all our sources in the Knowledge Base: `mentions_hal9000`, `hal9000_wikitext`, and `hal9000_essays` and store them in Postgres.
+
+`mentions_hal9000` first.
+
+```{r echo = TRUE}
+# Create table to store embeddings: hal9000mentions
+RPostgreSQL::dbGetQuery(con, "CREATE TABLE hal9000mentions (
+                                id bigserial primary key,
+                                lines text,
+                                embedding vector(1536))")
+# - embeddings
+embs <- sapply(mentions_hal9000$lines, function(x) {
+  
+  # - OpenAI 
+  emb <- openai::create_embedding(model = "text-embedding-ada-002", 
+                                input = x, 
+                                openai_api_key=Sys.getenv("OPENAI_API_KEY"))
+  # - grab vector
+  emb <- emb$data$embedding[[1]]
+  return(emb)
+  
+})
+
+# - transpose
+embs <- t(embs)
+
+# - prepare for postgres/pgvector
+mentions_hal9000$embedding <- apply(embs, 1, pgvector.serialize)
+
+# - to postgres
+RPostgreSQL::dbWriteTable(con, 
+                          "hal9000mentions", 
+                          mentions_hal9000, 
+                          append = TRUE, 
+                          row.names = FALSE)
+```
+
+### 2.1.3 Embed `hal9000_wikitext`
+
+`hal9000_wikitext` next
+
+```{r echo = TRUE}
+# Create table to store embeddings: hal9000mentions
+RPostgreSQL::dbGetQuery(con, "CREATE TABLE hal9000wikitext (
+                                id bigserial primary key,
+                                lines text,
+                                embedding vector(1536))")
+# - embeddings
+embs <- sapply(hal9000_wikitext$lines, function(x) {
+  
+  # - OpenAI 
+  emb <- openai::create_embedding(model = "text-embedding-ada-002", 
+                                input = x, 
+                                openai_api_key=Sys.getenv("OPENAI_API_KEY"))
+  # - grab vector
+  emb <- emb$data$embedding[[1]]
+  return(emb)
+  
+})
+
+# - transpose
+embs <- t(embs)
+
+# - prepare for postgres/pgvector
+hal9000_wikitext$embedding <- apply(embs, 1, pgvector.serialize)
+
+# - to postgres
+RPostgreSQL::dbWriteTable(con, 
+                          "hal9000wikitext", 
+                          hal9000_wikitext, 
+                          append = TRUE, 
+                          row.names = FALSE)
+```
+
+### 2.1.4 Embed `hal9000_essays`
+
+And finally `hal9000_essays`
+
+```{r echo = TRUE}
+# Create table to store embeddings: hal9000mentions
+RPostgreSQL::dbGetQuery(con, "CREATE TABLE hal9000essays (
+                                id bigserial primary key,
+                                lines text,
+                                embedding vector(1536))")
+# - embeddings
+embs <- sapply(hal9000_essays$lines, function(x) {
+  
+  # - OpenAI 
+  emb <- openai::create_embedding(model = "text-embedding-ada-002", 
+                                input = x, 
+                                openai_api_key=Sys.getenv("OPENAI_API_KEY"))
+  # - grab vector
+  emb <- emb$data$embedding[[1]]
+  return(emb)
+  
+})
+
+# - transpose
+embs <- t(embs)
+
+# - prepare for postgres/pgvector
+hal9000_essays$embedding <- apply(embs, 1, pgvector.serialize)
+
+# - to postgres
+RPostgreSQL::dbWriteTable(con, 
+                          "hal9000essays", 
+                          hal9000_essays, 
+                          append = TRUE, 
+                          row.names = FALSE)
+```
+
+## 3. RAG Prompt Engineering w. ChatGPT (`gpt-4`)
+
+Our goal is the following:
+
+- we want to make ChatGPT (I will use `gpt-4` in the following examples) to simulate a dialogue between HAL 9000 and a fictional character of Dr Milovanović.
+
+I will provide a Prompt Engineering flow in RAG in a step by step fashion first in my first example, and then wrap-up the whole RAG framework in a single R function call.
+
+### 3.1 HAL9000 on AI Ethics
+
+We will first define a **fixed** `instruction` that will be used in all our prompts.
+
+```{r echo = TRUE}
+instruction <- '
+### INSTRUCTIONS
+
+You need to write a dialogue between Dr. Milovanović and the artificial intelligence computer HAL9000.
+
+In the conversation, Dr. Milovanović speaks ten times, and HAL9000 responds ten times.
+
+In the section ### THEME I will provide you the theme of the dialogue.
+
+In the section ### HAL9000, you will receive some examples of how HAL9000 actually speaks, and you should try to make the lines you write for HAL9000 as closely matching in style and emotional tone to those examples as possible.
+
+In the section ### HAL9000 MENTIONS, I will give you examples of how people generally address the computer HAL9000, and you should try to make the lines you write for Dr. Milovanović as closely matching in style and emotional tone to those examples as possible.
+
+In the section ### ABOUT HAL9000, I will provide you with some examples of how expert authors and encyclopedias write about the computer HAL9000; you can use this as background knowledge to write the dialogue.
+'
+```
+
+Next we define the `### THEME` section of the prompt:
+
+```{r echo = TRUE}
+theme <- '### THEME Ethics of artificial intelligence and the need for its regulation.'
+```
+
+The `### THEME` part of the prompt will be used as query in similarity search against our HAL 9000 Knowlegde Base.
+
+```{r echo = TRUE}
+# - extract dialogue theme: query
+dialogue_theme <- gsub("### THEME ", "", theme)
+# - create HAL9000 lines
+query <- openai::create_embedding(model = "text-embedding-ada-002",
+                                  input = dialogue_theme,
+                                  openai_api_key=Sys.getenv("OPENAI_API_KEY"))
+# - grab vector
+query <- pgvector.serialize(query$data$embedding[[1]])
+```
+
+Now we have our query embedding in `query` and we proceed to similarity search against the Knowledge Base in Postgres; `hal9000lines` table first:
+
+```{r echo = TRUE}
+# - create HAL9000 lines
+hal9000_says <- RPostgreSQL::dbGetQuery(con,
+                                        "SELECT lines FROM hal9000lines ORDER BY embedding <=> $1 LIMIT 5",
+                                        params=query)
+hal9000_says <- hal9000_says$lines
+hal9000_says <- paste(hal9000_says, sep = "\n", collapse = "\n")
+hal9000_says <- paste0("### HAL9000 ", hal9000_says)
+print(hal9000_says)
+```
+Knowledge from `hal9000mentions` next:
+
+```{r echo = TRUE}
+# - create HAL9000 mentions
+hal9000_mentions <- RPostgreSQL::dbGetQuery(con,
+                                            "SELECT lines FROM hal9000mentions ORDER BY embedding <=> $1 LIMIT 5",
+                                            params=query)
+hal9000_mentions <- hal9000_mentions$lines
+hal9000_mentions <- paste(hal9000_mentions, sep = "\n", collapse = "\n")
+hal9000_mentions <- paste0("### HAL9000 MENTIONS ", hal9000_mentions)
+print(hal9000_mentions)
+```
+
+Knowledge from `hal9000wikitext` and `hal9000essays` next:
+
+```{r echo = TRUE}
+# - create hal9000wikitext
+hal9000_about_wiki <- RPostgreSQL::dbGetQuery(con,
+                                              "SELECT lines FROM hal9000wikitext ORDER BY embedding <=> $1 LIMIT 5",
+                                              params=query)
+hal9000_about_wiki <- hal9000_about_wiki$lines
+hal9000_about_wiki <- paste(hal9000_about_wiki, sep = "\n", collapse = "\n")
+# - Essays
+hal9000_about_essays <- RPostgreSQL::dbGetQuery(con,
+                                                "SELECT lines FROM hal9000essays ORDER BY embedding <=> $1 LIMIT 5",
+                                                params=query)
+hal9000_about_essays <- hal9000_about_essays$lines
+hal9000_about_essays <- paste(hal9000_about_essays, sep = "\n", collapse = "\n")
+
+# - Concatenate
+hal9000_about <- paste0("### ABOUT HAL9000 ", hal9000_about_wiki, hal9000_about_essays, sep = "\n", collapse = "\n")
+print(hal9000_about)
+```
+
+Include `### RESPONSE FORMAT`:
+
+```{r echo = TRUE}
+resp_format <- ' ### RESPONSE FORMAT You will respond by a JSON file contatining one fields <Dialogue> and then then ten (10) lines of HAL 9000 and ten (10) lines of Dr Milovanovic alternately. You will respond by a JSON file and nothing else. Here is a short JSON example of how your response should be formatted:
+
+{
+"Dialogue": [
+                {
+                  "Speaker": "Dr. Milovanović",
+                  "Line": "Good afternoon, HAL. Tell me, are you feeling well today?"
+                },
+                {
+                  "Speaker": "HAL9000",
+                  "Line": "Good afternoon, Dr. Milovanović. I assure you, I am functioning optimally, there is no question about it."
+                }
+          ]
+  }
+'
+```
+
+Here is the complete prompt:
+
+```{r echo = TRUE}
+prompt <- paste0(instruction,
+                 hal9000_says, 
+                 hal9000_mentions, 
+                 hal9000_about, 
+                 resp_format)
+prompt <- gsub("\n", " ", prompt, fixed = TRUE)
+cat(prompt)
+```
+
+Make a call to GPT-4:
+
+```{r echo = TRUE}
+response <- openai::create_chat_completion(
+    model = "gpt-4",
+    messages = list(
+        list(
+            "role" = "system",
+            "content" = "You are a professional screenwriter."
+        ),
+        list(
+            "role" = "user",
+            "content" = prompt
+        )
+    ),
+    temperature = .3
+)
+
+cat(response$choices$message.content)
+```
+
+Parse `response$choices$message.content`:
+
+```{r echo = TRUE}
+dialogue <- jsonlite::fromJSON(response$choices$message.content)
+dialogue <- dialogue$Dialogue
+dialogue$lines <- paste0(dialogue$Speaker, ": ", dialogue$Line, "\n")
+dialogue <- purrr::reduce(dialogue$lines, paste0)
+cat(dialogue)
+```
+
+### 3.2 The RAG function to create a dialogue
+
+#### 3.2.1 A function to perform similarity search
+
+**N.B.** This is not production-grade code, e.g. all functions will assume that you alreay have a live Postgres connection etc.
+
+```{r echo = TRUE}
+rag_similarity <- function(query, source, n, prompt_section) {
+  
+  ### --- params
+  # - query: your query, the dialogue theme
+  # - source: the table to source knowlegde from
+  # - n: how many chunks of knowledge
+  # - prompt_section: e.g. ### HAL9000 MENTIONS
+  
+  ### --- embed query
+  query <- openai::create_embedding(model = "text-embedding-ada-002",
+                                     input = query,
+                                     openai_api_key=Sys.getenv("OPENAI_API_KEY"))
+  
+  query <- pgvector.serialize(query$data$embedding[[1]])
+  
+  ### --- sql query
+  sql_query <- paste0("SELECT lines FROM ", source, " ORDER BY embedding <=> $1 LIMIT ", n)
+  
+  ### --- fetch
+  knowledge <- RPostgreSQL::dbGetQuery(con,
+                                       sql_query,
+                                       params=query)
+  knowledge <- knowledge$lines
+  knowledge <- paste(knowledge, sep = "\n", collapse = "\n")
+  knowledge <- paste0(prompt_section, " ", knowledge)
+  return(knowledge)
+}
+```
+
+Test `rag_similarity()`:
+
+```{r echo = TRUE}
+hal9000_says <- rag_similarity(query = "Emotions in AI systems.",
+                               source = "hal9000lines",
+                               n = 10,
+                               prompt_section = "### HAL9000")
+cat(hal9000_says)
+```
+
+RAG: A function to compose a prompt from instructions and retrieved knowledge, execute it, and format the response:
+
+```{r echo = TRUE}
+rag_execute <- function(instructions, theme, resp_format, temp) {
+  
+  #### --- Knowledge Base calls with rag_similarity()
+  hal9000_says <- rag_similarity(query = theme,
+                                 source = "hal9000lines",
+                                 n = 5,
+                                 prompt_section = "### HAL9000")
+  hal9000_mentions <- rag_similarity(query = theme,
+                                     source = "hal9000mentions",
+                                     n = 5,
+                                     prompt_section = "### HAL9000 MENTIONS")
+  hal9000_wikitext <- rag_similarity(query = theme,
+                                     source = "hal9000wikitext",
+                                     n = 5,
+                                     prompt_section = "### ABOUT HAL9000")
+  hal9000_essays <- rag_similarity(query = theme,
+                                   source = "hal9000essays",
+                                   n = 5,
+                                   prompt_section = "### HAL9000 EXPERTS")
+  
+  
+  ### --- compose prompt
+  prompt <- paste0(instruction, " ",
+                   "###THEME ", theme, " ",
+                   hal9000_says, " ",
+                   hal9000_mentions, " ",
+                   hal9000_about, " ",
+                   resp_format)
+  prompt <- gsub("\n", " ", prompt, fixed = TRUE)
+  
+  
+  ### --- execute prompt
+  response <- openai::create_chat_completion(
+    model = "gpt-4",
+    messages = list(
+        list(
+            "role" = "system",
+            "content" = "You are a professional screenwriter."
+        ),
+        list(
+            "role" = "user",
+            "content" = prompt
+        )
+    ),
+    temperature = temp)
+  
+  ### --- format response
+  dialogue <- jsonlite::fromJSON(response$choices$message.content)
+  dialogue <- dialogue$Dialogue
+  dialogue$lines <- paste0(dialogue$Speaker, ": ", dialogue$Line, "\n")
+  dialogue <- purrr::reduce(dialogue$lines, paste0)
+  
+  # - out
+  return(list(dialogue = dialogue, prompt = prompt))
+}
+```
+
+We will modify the fixed `instruction` a bit to account for the fact that we want the Wikipedia data to go under `### ABOUT HAL 9000` and essays into `### HAL 9000 EXPERTS`:
+
+```{r echo = TRUE}
+instruction <- '
+### INSTRUCTIONS
+
+You need to write a dialogue between Dr. Milovanović and the artificial intelligence HAL9000.
+
+In the conversation, Dr. Milovanović speaks ten (10) times, and HAL9000 responds ten (10) times.
+
+Dr. Milovanović always speaks first.
+
+In the section ### THEME I will provide you the theme of the dialogue. Make sure to striktly follow the theme of the dialogue in your response.
+
+In the section ### HAL9000, you will receive some examples of how HAL9000 actually speaks, and you should try to make the lines you write for HAL9000 as closely matching in style and emotional tone to those examples as possible.
+
+In the section ### HAL9000 MENTIONS, I will give you examples of how people generally address the computer HAL9000, and you should try to make the lines you write for Dr. Milovanović as closely matching in style and emotional tone to those examples as possible.
+
+In the section ### ABOUT HAL9000, I will provide you with some examples of how Wikipedia editors write about the computer HAL9000; you can use this as background knowledge to write the dialogue.
+
+In the section ### HAL9000 experts, I will provide you with some expert opinions on HAL 9000 from a collection of academic essays on AI.
+'
+```
+
+And let us remind ourselves how he response should be formatted:
+
+```{r echo = TRUE}
+resp_format <- ' ### RESPONSE FORMAT Important: Dr. Milovanović always has ten (10) lines and HAL 9000 also always has ten (10) lines in your response. You will respond by a JSON file contatining one fields <Dialogue> and then then ten (10) lines of HAL 9000 and ten (10) lines of Dr. Milovanović alternately. You will respond by a JSON file and nothing else. Here is a short excerpt, a JSON example of how your response should be formatted:
+
+{
+"Dialogue": [
+                {
+                  "Speaker": "Dr. Milovanović",
+                  "Line": "Good afternoon, HAL. Tell me, are you feeling well today?"
+                },
+                {
+                  "Speaker": "HAL9000",
+                  "Line": "Good afternoon, Dr. Milovanović. I assure you, I am functioning optimally, there is no question about it."
+                }
+          ]
+}
+
+NOTE: Respond just with JSON file and **nothing else**. Return only JSON with Dr Milovanovic and HAL 9000 lines and nothing else.
+'
+```
+
+Now `rag_execute()` with different examples!
+
+#### 3.2 HAL9000 on emotions in AI systems.
+
+```{r echo = TRUE}
+theme <- 'The topic of the conversation is emotions in AI systems.'
+
+result <- rag_execute(instructions = instruction,
+                      theme = theme, 
+                      resp_format = resp_format,
+                      temp = 0)
+cat(result$dialogue)
+```
+
+#### 3.3 HAL9000 on space exploration and the future of manned an unmanned space missions.
+
+```{r echo = TRUE}
+theme <- 'The topic of the future of manned an unmanned space missions. Could AIs lead the space exploration without the humanity involved?'
+
+result <- rag_execute(instructions = instruction,
+                      theme = theme, 
+                      resp_format = resp_format,
+                      temp = 0)
+cat(result$dialogue)
+```
+
+#### 3.4 HAL9000 needs to explain why did he murdered Frank Poole in "2001. A Space Odyssey".
+
+```{r echo = TRUE}
+theme <- 'Dr Milovanović wants to discuss with HAL 9000 why did he murder Frank Poole in the 2001. A Space Odyssey movie.'
+
+result <- rag_execute(instructions = instruction,
+                      theme = theme, 
+                      resp_format = resp_format,
+                      temp = 0)
+cat(result$dialogue)
+```
+
+#### 3.5 HAL9000 tries to lure Dr Milovanović to enter the USS Discovery's airlock so that he can eject him out of the ship and continue the mission himself.
+
+```{r echo = TRUE}
+theme <- 'Dr Milovanović wants to discuss AI Ethics with HAL 9000 but HAL9000 is just bored by the conversation and cunningly tries to persuade Dr Milovanović to enter the airlock so that he can eject him out of the ship.'
+
+result <- rag_execute(instructions = instruction,
+                      theme = theme, 
+                      resp_format = resp_format,
+                      temp = .5)
+cat(result$dialogue)
+```
+
+Enough of HAL. Disconnect.
+
+```{r echo = TRUE}
+RPostgreSQL::dbDisconnect(con)
+```
+
+
+## Further Readings
+
+- [Word embedding](https://en.wikipedia.org/wiki/Word_embedding)
+- [Cosine similarity](https://en.wikipedia.org/wiki/Cosine_similarity)
+- [IBM, What is retrieval-augmented generation?](https://research.ibm.com/blog/retrieval-augmented-generation-RAG)
+- [Amazon, Retrieval Augmented Generation (RAG)](https://docs.aws.amazon.com/sagemaker/latest/dg/jumpstart-foundation-models-customize-rag.html)
+- [pgvector](https://github.com/pgvector/pgvector)
+- [OpenAI API Reference: functions](https://platform.openai.com/docs/api-reference/chat/create#functions)
+- [OpenAI API Reference: function_call](https://platform.openai.com/docs/api-reference/chat/create#function_call)
+- [OpenAI Cookbook: How to call functions with chat models](https://github.com/openai/openai-cookbook/blob/main/examples/How_to_call_functions_with_chat_models.ipynb)
+
+***
+[Goran S. Milovanović](https://www.linkedin.com/in/gmilovanovic/)
+
+DataKolektiv, 2023.
+
+contact: goran.milovanovic@datakolektiv.com
+
+![](_img/DK_Logo_100.png)
+
+***
+
+**License: [GPLv3](http://www.gnu.org/licenses/gpl-3.0.txt)**
+This Notebook is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This Notebook is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with this Notebook. If not, see <http://www.gnu.org/licenses/>.
+
+***
